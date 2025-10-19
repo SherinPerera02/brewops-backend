@@ -1,4 +1,4 @@
-# Softora - Backend
+# Backend
 
 This folder contains the Node.js/Express backend API for the Softora application. It can be used as an independent repository when split from the monorepo.
 
