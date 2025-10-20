@@ -1,14 +1,57 @@
 const mysql = require("mysql2/promise");
 require("dotenv").config();
+const { URL } = require("url");
 
-// Database configuration
-const dbConfig = {
-  host: "localhost",
-  user: "root",
-  password: "",
-  database: "brewops_app",
-  port: 3306,
+// Build DB config from DATABASE_URL (Render) or DB_* env vars
+let dbConfig = {
+  host: process.env.DB_HOST || "localhost",
+  user: process.env.DB_USER || "root",
+  password: process.env.DB_PASSWORD || "",
+  database: process.env.DB_NAME || "brewops_app",
+  port: process.env.DB_PORT ? Number(process.env.DB_PORT) : 3306,
 };
+
+// When using a full connection string from an external provider (DATABASE_URL),
+// we may not be allowed to run `CREATE DATABASE` (e.g. PlanetScale). Track that.
+let databaseUrlUsed = false;
+
+if (process.env.DATABASE_URL) {
+  try {
+    const parsed = new URL(process.env.DATABASE_URL);
+    if (parsed.protocol && parsed.protocol.startsWith("mysql")) {
+      dbConfig = {
+        host: parsed.hostname,
+        user: parsed.username,
+        password: parsed.password,
+        database: parsed.pathname
+          ? parsed.pathname.replace(/^\//, "")
+          : dbConfig.database,
+        port: parsed.port ? Number(parsed.port) : dbConfig.port,
+      };
+      databaseUrlUsed = true;
+      console.log(
+        "Using DATABASE_URL for DB connection (host=%s port=%s user=%s database=%s)",
+        dbConfig.host,
+        dbConfig.port,
+        dbConfig.user,
+        dbConfig.database
+      );
+    }
+  } catch (err) {
+    console.warn(
+      "Failed to parse DATABASE_URL, falling back to DB_* vars:",
+      err.message
+    );
+  }
+} else {
+  console.log(
+    "Using DB_HOST=%s DB_PORT=%s DB_USER=%s DB_NAME=%s",
+    dbConfig.host,
+    dbConfig.port,
+    dbConfig.user,
+    dbConfig.database
+  );
+}
 
 // Create connection pool
 const pool = mysql.createPool({
@@ -21,22 +64,49 @@ const pool = mysql.createPool({
 // Initialize database and tables
 async function initializeDatabase() {
   try {
-    // Create database if it doesn't exist
-    const connection = await mysql.createConnection({
-      host: dbConfig.host,
-      user: dbConfig.user,
-      password: dbConfig.password,
-      port: dbConfig.port,
-    });
+    // Create database if it doesn't exist. Retry a few times if DB is not ready yet.
+    const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
-    await connection.execute(
-      `CREATE DATABASE IF NOT EXISTS ${dbConfig.database}`
-    );
+    async function connectWithRetry(retries = 5, delayMs = 2000) {
+      let lastErr;
+      for (let i = 1; i <= retries; i++) {
+        try {
+          console.log(
+            `Attempting DB connection to ${dbConfig.host}:${dbConfig.port} (attempt ${i}/${retries})`
+          );
+          const connection = await mysql.createConnection({
+            host: dbConfig.host,
+            user: dbConfig.user,
+            password: dbConfig.password,
+            port: dbConfig.port,
+          });
+          return connection;
+        } catch (err) {
+          lastErr = err;
+          console.error(
+            `DB connection attempt ${i} failed:`,
+            err.code || err.message
+          );
+          if (i < retries) await sleep(delayMs);
+        }
+      }
+      throw lastErr;
+    }
+
+    const connection = await connectWithRetry(5, 2000);
+
+    if (!databaseUrlUsed) {
+      await connection.execute(
+        `CREATE DATABASE IF NOT EXISTS ${dbConfig.database}`
+      );
+      console.log(`Database '${dbConfig.database}' created or already exists`);
+    } else {
+      console.log("DATABASE_URL detected — skipping CREATE DATABASE step");
+    }
+
     await connection.end();
 
-    console.log(`Database '${dbConfig.database}' created or already exists`);
-
-    // Create tables
+    // Create tables (assumes the provided database already exists)
     await createTables();
   } catch (error) {
     console.error("Error initializing database:", error);
@@ -52,7 +122,8 @@ async function createTables() {
       CREATE TABLE IF NOT EXISTS users (
         id INT AUTO_INCREMENT PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
-        email VARCHAR(255) UNIQUE NOT NULL,
+        -- use 191 for indexed varchar to be safe with utf8mb4 (max key length 1000 bytes on older MySQL)
+        email VARCHAR(191) UNIQUE NOT NULL,
         password VARCHAR(255) NOT NULL,
         role ENUM('supplier', 'staff', 'manager', 'admin') NOT NULL,
         must_change_password TINYINT(1) DEFAULT 0,
@@ -63,7 +134,7 @@ async function createTables() {
         status ENUM('active', 'inactive', 'pending') DEFAULT 'pending',
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-      )
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci ROW_FORMAT=DYNAMIC;
     `;
 
     // Employees reference table (used to validate registration employee IDs)
